@@ -10,14 +10,18 @@
 2. Якщо товар знайдено і найнижча ціна конкурента ("price") нижча за нашу
    ("Ціна Агродрузі") — пишемо цю ціну в "Рекомендація", "availability" в
    "Наявність", назву конкурента в "Джерело", посилання в "Посилання".
-   2.1 "Наявність" == "Немає в наявності" -> рядок голубий (#80bcd7).
-   2.2 "Наявність" != "Немає в наявності" -> рядок зелений (#82d200).
+   2.1 "Наявність" == "Немає в наявності" -> голубий (#80bcd7).
+   2.2 "Наявність" != "Немає в наявності" -> зелений (#82d200).
 3. Товар знайдено, але найнижча ціна >= нашій -> "Ціна оптимальна", жовтий (#fffc00).
 4. Товар не знайдено -> "Не знайдено", червоний (#ff6f6d).
+
+Кольором позначаємо лише клітинки у колонках "Рекомендація" та "Наявність".
+Назва результуючого файлу містить дату аналізу у форматі YYYY-MM-DD.
 """
 
 import re
 from collections import defaultdict
+from datetime import date
 
 import pandas as pd
 from openpyxl import load_workbook
@@ -26,7 +30,8 @@ from openpyxl.styles import PatternFill
 # --- Конфігурація ---------------------------------------------------------
 
 INPUT_FILE = 'Input.xlsx'
-OUTPUT_FILE = 'Input_analyzed_with_urls.xlsx'
+# До назви результуючого файлу дописуємо дату у форматі YYYY-MM-DD.
+OUTPUT_FILE = f'Input_analyzed_with_urls_{date.today().isoformat()}.xlsx'
 
 COMPETITORS = [
     ('agrodoctor', 'agrodoctor_prices.xlsx'),
@@ -209,15 +214,19 @@ def analyze(df_input, hits, row_art_count):
 
 
 def write_output(df_input, fills):
-    """Записує результат і фарбує всі клітинки кожного рядка."""
+    """Записує результат і фарбує клітинки колонок "Рекомендація" та "Наявність"."""
     df_input.to_excel(OUTPUT_FILE, index=False)
 
     wb = load_workbook(OUTPUT_FILE)
     ws = wb.active
-    n_cols = len(df_input.columns)
+    # openpyxl рахує колонки з 1; get_loc повертає індекс з 0.
+    colored_cols = [
+        df_input.columns.get_loc(COL_RECOMMENDATION) + 1,
+        df_input.columns.get_loc(COL_AVAILABILITY) + 1,
+    ]
     for row_idx, fill in enumerate(fills):
         excel_row = row_idx + 2  # +1 заголовок, +1 бо openpyxl рахує з 1
-        for col_idx in range(1, n_cols + 1):
+        for col_idx in colored_cols:
             ws.cell(row=excel_row, column=col_idx).fill = fill
     wb.save(OUTPUT_FILE)
 
