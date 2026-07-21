@@ -7,15 +7,14 @@
    1.1 Шукаємо співпадіння в колонках name, references, description.
    1.2 Якщо повного співпадіння немає і артикул містить крапку "." — шукаємо по
        значенню артикула до крапки (напр. "AZ10331.41" -> "AZ10331").
-2. Якщо товар знайдено і найнижча ціна конкурента ("price") нижча за нашу
-   ("Ціна Агродрузі") — пишемо цю ціну в "Рекомендація", "availability" в
-   "Наявність", назву конкурента в "Джерело", посилання в "Посилання".
-   2.1 "Наявність" == "Немає в наявності" -> голубий (#80bcd7).
-   2.2 "Наявність" != "Немає в наявності" -> зелений (#82d200).
-3. Товар знайдено, але найнижча ціна >= нашій -> "Ціна оптимальна", жовтий (#fffc00).
-4. Товар не знайдено -> "Не знайдено", червоний (#ff6f6d).
+2. Для кожного джерела окремо додаємо колонку з найдешевшою знайденою ціною:
+   "Ціна Рамос" (tvk-ramos) та "Ціна Агродоктор" (agrodoctor). Якщо в джерелі
+   товар не знайдено — ціна 0.
+3. Колір конкретної клітинки з ціною:
+   - зелений (#82d200), якщо ціна нижча за нашу і товар є в наявності;
+   - червоний (#ff6f6d), якщо немає в наявності, ціна вища/рівна або не знайдено.
+4. Якщо ціна знайдена (!= 0) — вона стає клікабельним посиланням на товар.
 
-Кольором позначаємо лише клітинки у колонках "Рекомендація" та "Наявність".
 Назва результуючого файлу містить дату аналізу у форматі YYYY-MM-DD.
 """
 
@@ -25,7 +24,7 @@ from datetime import date
 
 import pandas as pd
 from openpyxl import load_workbook
-from openpyxl.styles import PatternFill
+from openpyxl.styles import Font, PatternFill
 
 # --- Конфігурація ---------------------------------------------------------
 
@@ -44,18 +43,24 @@ SEARCH_COLUMNS = ['name', 'references', 'description']
 # Колонки нашого файлу.
 COL_ARTICLE = 'Артикул'
 COL_OUR_PRICE = 'Ціна Агродрузі'
-COL_RECOMMENDATION = 'Рекомендація'
-COL_AVAILABILITY = 'Наявність'
-COL_SOURCE = 'Джерело'
-COL_URL = 'Посилання'
+
+# Для кожного конкурента — своя колонка з його ціною (порядок = порядок колонок).
+SOURCE_COLUMNS = [
+    ('tvk-ramos', 'Ціна Рамос'),
+    ('agrodoctor', 'Ціна Агродоктор'),
+]
+
+# Ціна-заглушка, коли товар у джерелі не знайдено.
+PRICE_NOT_FOUND = 0
 
 OUT_OF_STOCK = 'Немає в наявності'
 
 # Кольори (ARGB для openpyxl).
-FILL_BLUE = PatternFill('solid', fgColor='FF80BCD7')    # знайдено, немає в наявності
-FILL_GREEN = PatternFill('solid', fgColor='FF82D200')   # знайдено, в наявності
-FILL_YELLOW = PatternFill('solid', fgColor='FFFFFC00')  # ціна оптимальна
-FILL_RED = PatternFill('solid', fgColor='FFFF6F6D')     # не знайдено
+FILL_GREEN = PatternFill('solid', fgColor='FF82D200')  # ціна нижча за нашу і є в наявності
+FILL_RED = PatternFill('solid', fgColor='FFFF6F6D')    # дорожче / немає в наявності / не знайдено
+
+# Шрифт для клікабельних цін-гіперпосилань (підкреслений, читабельний на заливці).
+LINK_FONT = Font(underline='single')
 
 # Мінімальна довжина "базового" (до крапки) артикула. Захищає від надто
 # загальних токенів на кшталт "38" (з "38.4V/2K1/JA/J2A"), які дали б тисячі
@@ -143,7 +148,11 @@ def build_matcher(tokens):
 
 
 def collect_hits(token_map, matcher):
-    """Прохід по всіх конкурентах. Повертає (row_idx, art_idx, level) -> [candidate]."""
+    """Прохід по всіх конкурентах.
+
+    Повертає (source, row_idx, art_idx, level) -> [(price, availability, url), ...].
+    Ключ містить source, бо ціни рахуємо окремо для кожного джерела.
+    """
     hits = defaultdict(list)
 
     for source, filename in COMPETITORS:
@@ -160,74 +169,79 @@ def collect_hits(token_map, matcher):
             matched = {m.group(0) for m in matcher.finditer(text)}
             if not matched:
                 continue
-            candidate = (price, avail, source, url)
+            candidate = (price, avail, url)
             for token in matched:
-                for key in token_map.get(token, ()):
-                    hits[key].append(candidate)
+                for row_idx, art_idx, level in token_map.get(token, ()):
+                    hits[(source, row_idx, art_idx, level)].append(candidate)
 
     return hits
 
 
+def best_for_source(hits, source, row_idx, art_count):
+    """Найнижча ціна конкретного джерела для рядка. -> (price, availability, url) або None.
+
+    Для кожного артикула рядка: повні співпадіння, або (якщо їх нема) — база (п.1.2).
+    """
+    pool = []
+    for art_idx in range(art_count):
+        full = hits.get((source, row_idx, art_idx, 0), [])
+        base = hits.get((source, row_idx, art_idx, 1), [])
+        pool.extend(full if full else base)
+    if not pool:
+        return None
+    return min(pool, key=lambda c: c[0])
+
+
 def analyze(df_input, hits, row_art_count):
-    """Формує колонки результату та колір для кожного рядка."""
-    recommendations, availabilities, sources, urls, fills = [], [], [], [], []
+    """Для кожного джерела формує колонку з ціною + дані для заливки/посилань.
 
-    for row_idx in range(len(df_input)):
-        our_price = clean_price(df_input.at[row_idx, COL_OUR_PRICE])
+    Повертає col_name -> {'urls': [...], 'fills': [...]}.
+    """
+    results = {}
 
-        # Для кожного артикула рядка: повні співпадіння, або (якщо їх нема) — база.
-        pool = []
-        for art_idx in range(row_art_count[row_idx]):
-            full = hits.get((row_idx, art_idx, 0), [])
-            base = hits.get((row_idx, art_idx, 1), [])
-            pool.extend(full if full else base)
+    for source, col_name in SOURCE_COLUMNS:
+        values, urls, fills = [], [], []
 
-        if not pool:
-            recommendations.append('Не знайдено')
-            availabilities.append(None)
-            sources.append(None)
-            urls.append(None)
-            fills.append(FILL_RED)
-            continue
+        for row_idx in range(len(df_input)):
+            our_price = clean_price(df_input.at[row_idx, COL_OUR_PRICE])
+            best = best_for_source(hits, source, row_idx, row_art_count[row_idx])
 
-        best_price, best_avail, best_source, best_url = min(pool, key=lambda c: c[0])
+            if best is None:
+                # Товар не знайдено -> ціна 0, клітинка червона.
+                values.append(PRICE_NOT_FOUND)
+                urls.append(None)
+                fills.append(FILL_RED)
+                continue
 
-        if best_price < our_price:
-            recommendations.append(best_price)
-            availabilities.append(best_avail)
-            sources.append(best_source)
-            urls.append(best_url)
-            in_stock = str(best_avail).strip() != OUT_OF_STOCK
-            fills.append(FILL_GREEN if in_stock else FILL_BLUE)
-        else:
-            recommendations.append('Ціна оптимальна')
-            availabilities.append(None)
-            sources.append(None)
-            urls.append(None)
-            fills.append(FILL_YELLOW)
+            price, avail, url = best
+            in_stock = str(avail).strip() != OUT_OF_STOCK
+            # Зелена лише якщо є в наявності і дешевше за нашу; інакше червона.
+            green = in_stock and price < our_price
+            values.append(price)
+            urls.append(None if pd.isna(url) else str(url))
+            fills.append(FILL_GREEN if green else FILL_RED)
 
-    df_input[COL_RECOMMENDATION] = recommendations
-    df_input[COL_AVAILABILITY] = availabilities
-    df_input[COL_SOURCE] = sources
-    df_input[COL_URL] = urls
-    return fills
+        df_input[col_name] = values
+        results[col_name] = {'urls': urls, 'fills': fills}
+
+    return results
 
 
-def write_output(df_input, fills):
-    """Записує результат і фарбує клітинки колонок "Рекомендація" та "Наявність"."""
+def write_output(df_input, results):
+    """Записує результат: заливка клітинок з цінами + гіперпосилання на товар."""
     df_input.to_excel(OUTPUT_FILE, index=False)
 
     wb = load_workbook(OUTPUT_FILE)
     ws = wb.active
-    # openpyxl рахує колонки з 1; get_loc повертає індекс з 0.
-    colored_cols = [
-        df_input.columns.get_loc(COL_RECOMMENDATION) + 1,
-        df_input.columns.get_loc(COL_AVAILABILITY) + 1,
-    ]
-    for row_idx, fill in enumerate(fills):
-        excel_row = row_idx + 2  # +1 заголовок, +1 бо openpyxl рахує з 1
-        for col_idx in colored_cols:
-            ws.cell(row=excel_row, column=col_idx).fill = fill
+    for col_name, data in results.items():
+        col_idx = df_input.columns.get_loc(col_name) + 1  # openpyxl рахує з 1
+        for row_idx, (url, fill) in enumerate(zip(data['urls'], data['fills'])):
+            cell = ws.cell(row=row_idx + 2, column=col_idx)  # +1 заголовок, +1 зсув
+            cell.fill = fill
+            # Ціна != 0 і є посилання -> робимо її клікабельною.
+            if url and cell.value != PRICE_NOT_FOUND:
+                cell.hyperlink = url
+                cell.font = LINK_FONT
     wb.save(OUTPUT_FILE)
 
 
@@ -237,18 +251,14 @@ def main():
     token_map, row_art_count = build_token_map(df_input)
     matcher = build_matcher(token_map.keys())
     hits = collect_hits(token_map, matcher)
-    fills = analyze(df_input, hits, row_art_count)
-    write_output(df_input, fills)
+    results = analyze(df_input, hits, row_art_count)
+    write_output(df_input, results)
 
-    # Коротка статистика.
-    recs = df_input[COL_RECOMMENDATION]
-    found_lower = sum(1 for r in recs if isinstance(r, (int, float)))
-    optimal = int((recs == 'Ціна оптимальна').sum())
-    not_found = int((recs == 'Не знайдено').sum())
     print(f'Аналіз завершено. Результати збережено у {OUTPUT_FILE}')
-    print(f'  Знайдено дешевше в конкурентів: {found_lower}')
-    print(f'  Ціна оптимальна: {optimal}')
-    print(f'  Не знайдено: {not_found}')
+    for _, col_name in SOURCE_COLUMNS:
+        fills = results[col_name]['fills']
+        green = sum(1 for f in fills if f is FILL_GREEN)
+        print(f'  {col_name}: дешевше за нас (зелені) — {green} з {len(fills)}')
 
 
 if __name__ == '__main__':
